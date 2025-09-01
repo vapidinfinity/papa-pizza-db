@@ -1,7 +1,7 @@
 <h1>
-    papa-pizza the sequel 🍕
+    papa-pizza, the sequel 🍕
     <br>
-    papa-pizza returns for more
+    your local pizza store's customer database backend!
 </h1>
 
 just another school compsci project 💔
@@ -23,7 +23,5 @@ as for the code, please see `main.py`.
 ---
 
 <sub>
-
-
 while you're here you might as well go check out my main project, <a href="https://getmythic.app/">Mythic.</a>
 </sub>
