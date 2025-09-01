@@ -217,4 +217,4 @@ __marimo__/
 
 # database(s)
 *.db
-*.sqlite*
+*.sql*
