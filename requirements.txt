@@ -1,2 +1,3 @@
 termcolor
 colorama
+sqlite3
