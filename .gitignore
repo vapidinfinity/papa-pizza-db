@@ -217,4 +217,5 @@ __marimo__/
 
 # database(s)
 *.db
+*.db-journal
 *.sql*
