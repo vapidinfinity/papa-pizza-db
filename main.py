@@ -393,6 +393,10 @@ class OrderManager:
             item = input("enter the name of the menu item you'd like to add: ").strip().lower()
 
         item = next((menu_item for menu_item in menu if menu_item.name.lower() == item), None)
+        
+        if item is None:
+            cprint("invalid menu item", "red")
+            return
 
         # Validate quantity
         try:
