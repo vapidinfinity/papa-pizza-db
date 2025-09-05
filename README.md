@@ -22,8 +22,15 @@ for the assignment components, please see `docs/`.
 
 as for the code, please see `main.py`.
 
+## software used
+- visual studio code
+- lucidchart
+- db browser for sqlite
+
 ---
 
 <sub>
+hello 🫃🏾🫃🏾🫃🏾🫃🏾🫃🏾
+
 while you're here you might as well go check out my main project, <a href="https://getmythic.app/">Mythic.</a>
 </sub>
