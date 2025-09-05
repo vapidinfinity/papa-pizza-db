@@ -14,6 +14,7 @@
 
 # note from esi:
 # i used ai to tidy the code because it was a bloody mess
+# --sql is used for syntax highlighting inline sql queries
 
 import sqlite3
 import signal
@@ -36,22 +37,21 @@ class DatabaseManager:
         self.conn = sqlite3.connect("papa-pizza.db")
         self.conn.row_factory = sqlite3.Row
         self.conn.autocommit = True
-        self.conn.execute("PRAGMA foreign_keys=ON;")
+        self.conn.execute("--sql\nPRAGMA foreign_keys=ON;")
         
         self.__create_schema__()
         self._seed_menu()
+        self._seed_default_user()
 
     def __create_schema__(self):
         self.conn.executescript(
             """--sql
-/* -- strange linting warning if i indent --
-            CREATE TABLE IF NOT EXISTS customers (
+            CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY,
-                first_name TEXT NOT NULL,
-                last_name TEXT,
-                email TEXT NOT NULL UNIQUE
+                username TEXT NOT NULL,
+                password TEXT NOT NULL, -- should be seeded but cmon now it's a school project
+                privilege_level INT NOT NULL DEFAULT 0
             );
-            */
 
             CREATE TABLE IF NOT EXISTS menu (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,11 +61,13 @@ class DatabaseManager:
 
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id INTEGER,
                 service_type INTEGER NOT NULL,
                 has_loyalty_card INTEGER NOT NULL,
                 is_discounted INTEGER NOT NULL DEFAULT 0,
                 paid INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(customer_id) REFERENCES accounts(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS order_items (
@@ -92,9 +94,81 @@ class DatabaseManager:
         self.conn.executemany(
             """--sql
             INSERT OR IGNORE INTO menu(name, price) VALUES(?, ?);
-            """,
-            pizzas
+            """, pizzas
         )
+    
+    def _seed_default_user(self):
+        self.conn.execute(
+            """--sql
+            INSERT OR IGNORE INTO accounts(username, password, privilege_level)
+            VALUES (?, ?, ?)
+            """, ("admin", "admin", AccountManager.PrivilegeLevel.ADMIN.value)
+        )
+
+class AccountManager:
+    """Manage user accounts, including login and privilege checks."""
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+        self.current_user_id: int | None = None
+        self.current_privilege: int = 0
+
+    class PrivilegeLevel(Enum):
+        """Enumeration of privilege levels for user accounts."""
+        USER = 0
+        ADMIN = 1
+
+    def _login(self, username: str, password: str) -> bool:
+        """Low-level authenticate (no prompting)."""
+        user = self.db.conn.execute(
+            "SELECT id, privilege_level FROM accounts WHERE username=? AND password=?;",
+            (username, password)
+        ).fetchone()
+        if not user:
+            return False
+        self.current_user_id = user["id"]
+        self.current_privilege = user["privilege_level"]
+        level_name = AccountManager.PrivilegeLevel(user["privilege_level"]).name.lower()
+        prefix = f"{level_name}: " if level_name != "user" else ""
+        cprint(f"logged in as {prefix}{colored(username, 'yellow', attrs=['bold'])}", "green")
+        return True
+
+    def login(self, username: str | None = None, password: str | None = None):
+        """Interactive login (prompts until success if creds not provided)."""
+        if username is not None and password is not None:
+            if not self._login(username, password):
+                cprint("invalid username or password", "red")
+            return
+        # prompt loop
+        while True:
+            u = input("username: ").strip()
+            p = input("password: ").strip()
+            if self._login(u, p):
+                break
+            cprint("invalid username or password", "red")
+
+    def user_exists(self, username: str) -> bool:
+        """Check if a user with the given username exists."""
+        user = self.db.conn.execute(
+            "SELECT id FROM accounts WHERE username=?;",
+            (username,)
+        ).fetchone()
+        
+        return user is not None
+    
+    def logout(self):
+        """Log out the current user."""
+        if self.current_user_id is not None:
+            cprint(f"logged out user with id #{self.current_user_id} successfully", "green")
+            self.current_user_id = None
+            self.current_privilege = 0
+        else:
+            cprint("no user currently logged in", "red")
+
+    def is_admin(self):
+        return self.current_privilege == AccountManager.PrivilegeLevel.ADMIN.value
+
+    def get_current_user_id(self):
+        return self.current_user_id
 
 # establish a base class for order items
 class OrderItem(ABC):
@@ -155,27 +229,29 @@ class Order:
     # Calculate total cost, apply discounts and delivery charges
     @property
     def total_cost(self):
-        """Compute total cost including discounts, delivery fee, and GST."""
-        cost = self.raw_cost
-        # Apply 5% discount for loyalty or bulk orders > $100
-        if cost > 100 or self.has_loyalty_card:
-            cost *= 0.95
-            self.is_discounted = True
-
-        if self.service_type is ServiceType.PICKUP:
-            pass
-        elif self.service_type is ServiceType.DELIVERY:
-            # Apply delivery charge if order is for delivery
-            cost += 8.00
+        """Compute total cost including discounts, delivery fee, and GST"""
+        base = self.raw_cost
+        discount_eligible = base > 100 or self.has_loyalty_card
+        if discount_eligible:
+            # mark once; calculation always from base so no compounding
+            if not self.is_discounted:
+                self.is_discounted = True
+            cost = base * 0.95
         else:
+            cost = base
+
+        if self.service_type is ServiceType.DELIVERY:
+            cost += 8.00
+        elif self.service_type is not ServiceType.PICKUP:
             raise ValueError("Invalid service type!")
 
         return cost * 1.1 # add 10% GST
     
 class OrderManager:
     """Manage creation, modification, processing, and listing of multiple orders."""
-    def __init__(self, db: DatabaseManager):
+    def __init__(self, db: DatabaseManager, account_manager: AccountManager):
         self.db = db
+        self.account_manager = account_manager
         self.orders: list[Order] = []
         self.current_order_id: int | None = None
         reload_menu(self)
@@ -207,9 +283,11 @@ class OrderManager:
         ).fetchone()
 
     def insert_order(self, service_type: int, has_loyalty: bool) -> int:
+        # Attach order to current user if signed in
+        customer_id = self.account_manager.get_current_user_id()
         cur = self.db.conn.execute(
-            "INSERT INTO orders(service_type, has_loyalty_card) VALUES(?,?);",
-            (service_type, int(has_loyalty)),
+            "INSERT INTO orders(customer_id, service_type, has_loyalty_card) VALUES(?,?,?);",
+            (customer_id, service_type, int(has_loyalty)),
         )
         return cur.lastrowid
 
@@ -217,17 +295,25 @@ class OrderManager:
         self.db.conn.execute("DELETE FROM orders WHERE id=?;", (order_id,))
 
     def fetch_orders(self):
+        """Return orders visible to current user (all if admin, own only otherwise)."""
+        if self.account_manager.is_admin():
+            return self.db.conn.execute(
+                "SELECT id, customer_id, service_type, has_loyalty_card, is_discounted, paid FROM orders ORDER BY id;"
+            ).fetchall()
+        uid = self.account_manager.get_current_user_id()
         return self.db.conn.execute(
-            "SELECT id, service_type, has_loyalty_card, is_discounted, paid FROM orders ORDER BY id;"
+            "SELECT id, customer_id, service_type, has_loyalty_card, is_discounted, paid FROM orders WHERE customer_id=? ORDER BY id;",
+            (uid,),
         ).fetchall()
 
     def fetch_order_by_id(self, order_id: int):
+        """Fetch single order row (includes customer_id for ownership checks)."""
         return self.db.conn.execute(
-            "SELECT id, service_type, has_loyalty_card, is_discounted, paid FROM orders WHERE id=?;",
+            "SELECT id, customer_id, service_type, has_loyalty_card, is_discounted, paid FROM orders WHERE id=?;",
             (order_id,),
         ).fetchone()
 
-    def db_add_order_item(self, order_id: int, menu_name: str):
+    def _db_add_order_item(self, order_id: int, menu_name: str):
         """Insert a single menu item row for an order."""
         menu_row = self.get_menu_item(menu_name)
         if not (self.fetch_order_by_id(order_id) and menu_row):
@@ -238,7 +324,7 @@ class OrderManager:
         )
         return True
 
-    def db_remove_order_item(self, order_id: int, menu_name: str):
+    def _db_remove_order_item(self, order_id: int, menu_name: str):
         """Remove one occurrence of a menu item from an order."""
         menu_row = self.get_menu_item(menu_name)
         if not (self.fetch_order_by_id(order_id) and menu_row):
@@ -275,8 +361,15 @@ class OrderManager:
         )
 
     def fetch_paid_orders(self):
+        """Return paid orders in scope (all if admin, own only otherwise)."""
+        if self.account_manager.is_admin():
+            return self.db.conn.execute(
+                "SELECT id, customer_id, service_type, has_loyalty_card, is_discounted, paid FROM orders WHERE paid=1 ORDER BY id;"
+            ).fetchall()
+        uid = self.account_manager.get_current_user_id()
         return self.db.conn.execute(
-            "SELECT id, service_type, has_loyalty_card, is_discounted, paid FROM orders WHERE paid=1 ORDER BY id;"
+            "SELECT id, customer_id, service_type, has_loyalty_card, is_discounted, paid FROM orders WHERE paid=1 AND customer_id=? ORDER BY id;",
+            (uid,),
         ).fetchall()
 
     def print_order(self, order: Order):
@@ -301,6 +394,7 @@ class OrderManager:
     # Add an order to the system
     def create_order(self, type: str | None = None):
         """Interactively prompt to create a new order with service type and loyalty flag."""
+        # (auth already enforced globally; per-method check removed)
         # prompt service type
         if type is None:
             type = input("Order type? (pickup/delivery): ").strip().lower()
@@ -331,16 +425,23 @@ class OrderManager:
             cprint("invalid order id", "red")
             return
         order_id = int(prompt)
-        if not self._get_order_by_id(order_id):
+        order = self._get_order_by_id(order_id)
+        if not order:
             cprint("order not found", "red")
             return
+        
+        # only allow removing own orders (unless admin)
+        if not self.account_manager.is_admin():
+            db_row = self.fetch_order_by_id(order_id)
+            if db_row and db_row["customer_id"] != self.account_manager.get_current_user_id():  # fixed .get misuse
+                cprint("you can only remove your own orders.", "red")
+                return
+            
         self.delete_order(order_id)
         if self.current_order_id == order_id:
             self.current_order_id = None
-        
         self._update_orders()
         cprint(f"order #{order_id} removed successfully!", "green")
-
 
     # switch order focus    
     def switch_order(self):
@@ -421,12 +522,10 @@ class OrderManager:
     def _add_order_item(self, item: OrderItem):
         """Helper to append a single OrderItem to the current order."""
         self._check_current_order()
-
         order = self._get_order_by_id(self.current_order_id)
         if order is None:
             return
-
-        if not self.db_add_order_item(order.id, item.name):
+        if not self._db_add_order_item(order.id, item.name):
             cprint("failed to add item.", "red")
             return
         order.items.append(item)
@@ -455,11 +554,15 @@ class OrderManager:
     def _remove_order_item(self, item: OrderItem):
         """Helper to remove a single OrderItem from the current order."""
         self._check_current_order()
-
         order = self._get_order_by_id(self.current_order_id)
         if order is None:
             return
-        if self.db_remove_order_item(order.id, item.name) and item in order.items:
+        if self._db_remove_order_item(order.id, item.name) and item in order.items:
+            # remove first occurrence in in-memory list to stay in sync with DB
+            for i, existing in enumerate(order.items):
+                if existing.name == item.name:
+                    del order.items[i]
+                    break
             cprint(f"removed {item.name} from order #{order.id}", "green")
         else:
             cprint(f"{item.name} not in current order.", "red")
@@ -520,8 +623,12 @@ class OrderManager:
                 paid=True,
             )
             order_total = temp.total_cost
-            print(f"order #{temp.id}: {colored(f'${order_total:.2f}', 'green')}")
+            
+            # indicate owner when admin viewing all
+            owner_suffix = " "+f"(user #{row['customer_id']})" if self.account_manager.is_admin() else ""
+            print(f"order #{temp.id}{owner_suffix}: {colored(f'${order_total:.2f}', 'green')}")
             total_sales += order_total
+            
         cprint(f"total sales for today: ${total_sales:.2f}", "green")
         cprint("thank you for using papa-pizza!", "green")
 
@@ -545,24 +652,26 @@ class Command:
         """Validate argument count then invoke the bound function."""
         signature = inspect.signature(self.__function__)
         params = list(signature.parameters.values())
-
-        #
         required_param_count = sum(
-            param.default == inspect.Parameter.empty and param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.POSITIONAL_ONLY)
-            for param in params
+            p.default == inspect.Parameter.empty and p.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_ONLY
+            ) for p in params
         )
-
-        # Validate token count
         if not required_param_count <= len(tokens) <= len(params):
-            cprint(f"invalid number of arguments for command '{self.name}' — (expected {required_count}-{len(params)}, got {len(tokens)})", "red")
+            cprint(
+                f"invalid number of arguments for command '{self.name}' — (expected {required_param_count}-{len(params)}, got {len(tokens)})",
+                "red"
+            )
             return None
-
         return self.__function__(*tokens)
 
 class CommandParser:
     """Parse user input, map to commands, and run them in a REPL."""
-    def __init__(self):
+    def __init__(self, account_manager=None):
         # Register basic commands
+        self.account_manager = account_manager
+        
         self.commands = [
             Command("help", self.show_help, "Display this help message."),
             Command("h", self.show_help, "Alias for 'help'."),
@@ -573,11 +682,12 @@ class CommandParser:
     def parse_and_execute(self, input_str):
         """Match the input string to a registered command and execute."""
         tokens = input_str.strip().split()
-        
         for command in self.commands:
             name_parts = command.name.split()
-            # if the command name matches the input, omit the matching indexes
             if tokens[:len(name_parts)] == name_parts:
+                if self.account_manager and self.account_manager.get_current_user_id() is None:
+                    cprint("please sign in first.", "red")
+                    return None
                 args = tokens[len(name_parts):]
                 return command.execute(args)
         
@@ -588,6 +698,9 @@ class CommandParser:
         """Display help with all available command names and descriptions."""
         cprint("available commands:", "green", attrs=["bold"])
         for cmd in self.commands:
+            # Only show admin commands if user is admin
+            if "[admin]" in cmd.description and (not self.account_manager or not self.account_manager.is_admin()):
+                continue
             signature = inspect.signature(cmd.__function__)
 
             # format params
@@ -625,8 +738,9 @@ class Application:
     """Wire together CLI commands with the OrderManager and start the REPL."""
     def __init__(self, *args):
         self.db = DatabaseManager()
-        self.order_manager = OrderManager(self.db)
-        parser = CommandParser()
+        self.account_manager = AccountManager(self.db)
+        self.order_manager = OrderManager(self.db, self.account_manager)
+        parser = CommandParser(self.account_manager)
         
         parser.commands.append(Command("menu", self.show_menu, "Show the menu"))
 
@@ -652,10 +766,12 @@ by vapidinfinity, aka esi
               
 for more information, type 'help' or 'h' at any time.
 to exit the program, type 'quit' or 'exit'.""")
+        
+        self.account_manager.login()
 
         if args:
             parser.parse_and_execute(" ".join(args))
-
+        
         parser.start_repl()
 
     @staticmethod
