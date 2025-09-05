@@ -6,6 +6,8 @@
 
 just another school compsci project 💔
 
+> hint: the default login is `admin`, password `admin`.
+
 ## dependencies
 * a markdown viewer (bundled with IDEs like visual studio code and fleet)
 * python interpreter >= v3.13.7 (it may run on older versions, but is untested; i am not responsible for any malfunction as a result of running it on an earlier version)
