@@ -861,7 +861,7 @@ class OrderManager:
         if name is None:
             name = input("menu item name: ").strip()
         cur = self.db.conn.execute(
-            "DELETE FROM menu WHERE lower(name)=lower(?);",
+            "DELETE FROM menu WHERE lower(name) LIKE lower(?);",
             (name,)
         )
         if cur.rowcount:
