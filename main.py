@@ -805,23 +805,101 @@ class OrderManager:
             role = "admin" if r["privilege_level"] == 1 else "user"
             print(f"#{r['id']}: {r['username']} ({role})")
 
-    def admin_promote(self, user_id: str):
+    def admin_promote(self, user_id: str | None = None):
         """promote user to admin"""
         if not self.account_manager.require_admin():
             return
-        if not user_id.isdigit():
-            cprint("invalid id", "red"); return
-        self.db.conn.execute("UPDATE accounts SET privilege_level=1 WHERE id=?;", (int(user_id),))
-        cprint("promoted", "green")
+        # fetch accounts
+        rows = self.db.conn.execute(
+            "SELECT id, username, privilege_level FROM accounts ORDER BY id;"
+        ).fetchall()
+        if not rows:
+            cprint("no accounts found", "red"); return
 
-    def admin_demote(self, user_id: str):
-        """demote admin to user"""
+        def do_promote(target_id: int):
+            r = self.db.conn.execute(
+                "SELECT id, username, privilege_level FROM accounts WHERE id=?;",
+                (target_id,)
+            ).fetchone()
+            if not r:
+                cprint("user not found", "red"); return
+            if r["privilege_level"] == 1:
+                cprint("already admin", "yellow"); return
+            self.db.conn.execute(
+                "UPDATE accounts SET privilege_level=1 WHERE id=?;",
+                (target_id,)
+            )
+            cprint(f"promoted #{target_id} ({r['username']})", "green")
+
+        # if id supplied directly
+        if user_id:
+            if not user_id.isdigit():
+                cprint("invalid id", "red"); return
+            do_promote(int(user_id))
+            return
+
+        # interactive selection
+        cprint("select a user to promote (non-admins shown):", "green")
+        non_admins = [r for r in rows if r["privilege_level"] == 0]
+        if not non_admins:
+            cprint("no non-admin users to promote", "yellow"); return
+        for r in non_admins:
+            print(f"#{r['id']}: {r['username']}")
+        raw = input("enter user id (blank to cancel): ").strip()
+        if not raw:
+            cprint("cancelled", "yellow"); return
+        if not raw.isdigit():
+            cprint("invalid id", "red"); return
+        do_promote(int(raw))
+
+    def admin_demote(self, user_id: str | None = None):
+        """demote an admin to user (interactive if no id provided)"""
         if not self.account_manager.require_admin():
             return
-        if not user_id.isdigit():
+        current_admin_id = self.account_manager.current_user_id
+        rows = self.db.conn.execute(
+            "SELECT id, username, privilege_level FROM accounts ORDER BY id;"
+        ).fetchall()
+        admins = [r for r in rows if r["privilege_level"] == 1]
+
+        if len(admins) <= 1:
+            cprint("cannot demote: only one admin exists", "yellow"); return
+
+        def do_demote(target_id: int):
+            r = self.db.conn.execute(
+                "SELECT id, username, privilege_level FROM accounts WHERE id=?;",
+                (target_id,)
+            ).fetchone()
+            if not r:
+                cprint("user not found", "red"); return
+            if r["privilege_level"] == 0:
+                cprint("user is not an admin", "yellow"); return
+            if target_id == current_admin_id and len(admins) == 1:
+                cprint("refusing to demote last admin (yourself)", "red"); return
+            self.db.conn.execute(
+                "UPDATE accounts SET privilege_level=0 WHERE id=?;",
+                (target_id,)
+            )
+            cprint(f"demoted #{target_id} ({r['username']})", "green")
+
+        # direct id path
+        if user_id:
+            if not user_id.isdigit():
+                cprint("invalid id", "red"); return
+            do_demote(int(user_id))
+            return
+
+        # interactive selection (exclude self only if last two? keep simple: allow unless last admin)
+        cprint("select an admin to demote:", "green")
+        for r in admins:
+            tag = "(you)" if r["id"] == current_admin_id else ""
+            print(f"#{r['id']}: {r['username']} {tag}")
+        raw = input("enter admin id (blank to cancel): ").strip()
+        if not raw:
+            cprint("cancelled", "yellow"); return
+        if not raw.isdigit():
             cprint("invalid id", "red"); return
-        self.db.conn.execute("UPDATE accounts SET privilege_level=0 WHERE id=?;", (int(user_id),))
-        cprint("demoted", "green")
+        do_demote(int(raw))
 
     def admin_menu_add(self, name: str | None = None, price: str | None = None):
         """add a menu item"""
