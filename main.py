@@ -140,9 +140,9 @@ class AccountManager:
             return
         # prompt loop
         while True:
-            u = input("username: ").strip()
-            p = input("password: ").strip()
-            if self._login(u, p):
+            user = input(colored("username: ", "magenta")).strip()
+            pwd = input(colored("password: ", "magenta")).strip()
+            if self._login(user, pwd):
                 break
             cprint("invalid username or password", "red")
 
@@ -642,6 +642,7 @@ def parse_boolean_input(prompt: str, handle_invalid: bool = False) -> bool:
     else:
         cprint("invalid input, please try again.", "red")
         return False
+
 class Command:
     """Bind a CLI command name to a function and its description."""
     def __init__(self, name: str, function: Callable, description: str):
@@ -743,6 +744,7 @@ class Application:
         self.order_manager = OrderManager(self.db, self.account_manager)
         parser = CommandParser(self.account_manager)
         
+        # register commands
         parser.commands.append(Command("menu", self.show_menu, "Show the menu"))
 
         parser.commands.append(Command("order create", self.order_manager.create_order, "Add an order"))
@@ -787,6 +789,8 @@ to exit the program, type 'quit' or 'exit'.""")
                 cprint(f"\n{type(item).__name__}:", "green", attrs=["bold"])
                 
             cprint(f"{item.name}: ${item.price:.2f}", "green")
+    
+    
             
 # Main function to run the program
 def main():
