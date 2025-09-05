@@ -16,6 +16,18 @@
 # i used ai to tidy the code TWICE because it was a bloody mess
 # --sql is used for syntax highlighting inline sql queries
 
+# ‼️‼️ DEFAULT USER IS ADMIN, WITH PASSWORD ADMIN
+# you'd know this if you read the README file tho 👍🏾👍🏾👍🏾👍🏾
+
+# quick start guide:
+#   - register a new user or login as admin
+#   - create an order
+#   - add items to order
+#   - process order to pay
+#   - admin can view daily sales summary and promote other users to admin
+#   - admin can reset database (deletes ALL data, including accounts)
+#   - enjoy!! this is incredibly overengineered for no reason at all other than spite :)
+
 import sqlite3
 import signal
 import sys
