@@ -236,7 +236,7 @@ class AccountManager:
         self.current_user_id = user["id"]
         level_name = AccountManager.PrivilegeLevel(user["privilege_level"]).name.lower()
         prefix = f"{level_name}: " if level_name != "user" else ""
-        cprint(f"logged in as {prefix}{colored(username, 'yellow', attrs=['bold'])}", "green")
+        cprint(f"logged in as {prefix}{colored(username, 'green', attrs=['bold'])}", "green")
         return True
 
     def login(self, username: str | None = None, password: str | None = None):
@@ -319,7 +319,7 @@ class AccountManager:
             cprint("error fetching user info", "red"); return
         level = AccountManager.PrivilegeLevel(user["privilege_level"]).name.lower()
         prefix = f"{level}: " if level != "user" else ""
-        cprint(f"you are logged in as {prefix}{colored(user['username'],'yellow',attrs=['bold'])}", "green")
+        cprint(f"you are logged in as {prefix}{colored(user['username'], 'green', attrs=['bold'])}", "green")
 
 # domain models
 class OrderItem(ABC):
