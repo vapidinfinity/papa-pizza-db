@@ -7,6 +7,8 @@
 just another school compsci project 💔
 
 > hint: the default login is `admin`, password `admin`.
+> for more info, see the quick start guide at the top of main.py
+
 
 ## dependencies
 * a markdown viewer (bundled with IDEs like visual studio code and fleet)
