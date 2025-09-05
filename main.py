@@ -19,6 +19,7 @@
 import sqlite3
 import signal
 import sys
+import atexit
 
 from typing import Callable
 from abc import ABC, abstractmethod
@@ -48,7 +49,7 @@ class DatabaseManager:
             """--sql
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY,
-                username TEXT NOT NULL,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 password TEXT NOT NULL, -- should be seeded but cmon now it's a school project
                 privilege_level INT NOT NULL DEFAULT 0
             );
@@ -77,6 +78,41 @@ class DatabaseManager:
                 FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
                 FOREIGN KEY(menu_item_id) REFERENCES menu(id)
             );
+
+            -- triggers for domain integrity
+            CREATE TRIGGER IF NOT EXISTS trg_menu_price_insert
+            BEFORE INSERT ON menu
+            WHEN NEW.price <= 0
+            BEGIN
+                SELECT RAISE(ABORT, 'price must be positive');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_menu_price_update
+            BEFORE UPDATE ON menu
+            WHEN NEW.price <= 0
+            BEGIN
+                SELECT RAISE(ABORT, 'price must be positive');
+            END;
+
+            -- view calculating final order totals (discount, delivery, gst) for reporting
+            CREATE VIEW IF NOT EXISTS order_totals AS
+            SELECT 
+                o.id              AS order_id,
+                o.customer_id,
+                o.service_type,
+                o.has_loyalty_card,
+                o.is_discounted,
+                o.paid,
+                o.created_at,
+                COALESCE(SUM(m.price),0) AS base_total,
+                CASE WHEN COALESCE(SUM(m.price),0) > 100 OR o.has_loyalty_card = 1 THEN 1 ELSE 0 END AS discount_applies,
+                ROUND(((CASE WHEN (COALESCE(SUM(m.price),0) > 100 OR o.has_loyalty_card=1)
+                        THEN COALESCE(SUM(m.price),0) * 0.95 ELSE COALESCE(SUM(m.price),0) END)
+                        + CASE WHEN o.service_type=1 THEN 8.0 ELSE 0 END) * 1.1, 2) AS final_total
+            FROM orders o
+            LEFT JOIN order_items oi ON oi.order_id = o.id
+            LEFT JOIN menu m ON m.id = oi.menu_item_id
+            GROUP BY o.id;
             """
         )
 
@@ -105,17 +141,73 @@ class DatabaseManager:
             """, ("admin", "admin", AccountManager.PrivilegeLevel.ADMIN.value)
         )
 
+    def reset_database(self):
+        """Reset the database to its initial state, preserving the admin account."""
+        prompt = input(colored("Are you sure you want to reset the database? This will delete all data except the admin account. (y/N): ", "red")).strip().lower()
+        if not parse_boolean_input(prompt, handle_invalid=True):
+            cprint("Database reset cancelled.", "yellow")
+            return
+        
+        self.conn.executescript(
+            """--sql
+            DROP TABLE IF EXISTS order_items;
+            DROP TABLE IF EXISTS orders;
+            DROP TABLE IF EXISTS menu;
+            DROP TABLE IF EXISTS accounts;
+            """
+        )
+
+        cprint("database reset to initial state", "green")
+        cprint("application will now exit; please restart", "yellow")
+        sys.exit(0)
+
 class AccountManager:
     """Manage user accounts, including login and privilege checks."""
     def __init__(self, db: DatabaseManager):
         self.db = db
         self.current_user_id: int | None = None
-        self.current_privilege: int = 0
 
     class PrivilegeLevel(Enum):
         """Enumeration of privilege levels for user accounts."""
         USER = 0
         ADMIN = 1
+        
+    @property
+    def current_privilege(self) -> int:
+        """Always reflect the latest privilege from the database."""
+        if self.current_user_id is None:
+            return 0
+        row = self.db.conn.execute(
+            "SELECT privilege_level FROM accounts WHERE id=? LIMIT 1;",
+            (self.current_user_id,)
+        ).fetchone()
+        return row["privilege_level"] if row else 0
+
+    # helpers
+    def _reset_session(self):
+        """Internal: clear current session state."""
+        self.current_user_id = None
+
+    def get_current_user_id(self):
+        """Accessor used by other components (compat/backwards)."""
+        return self.current_user_id
+
+    def require_login(self) -> bool:
+        """Return True if logged in; otherwise notify and return False."""
+        if self.current_user_id is None:
+            cprint("please register/login first, type 'help' or 'h' for assistance", "red")
+            return False
+        return True
+
+    def require_admin(self) -> bool:
+        """Return True if user has admin privileges; otherwise notify and return False."""
+        if not self.require_login():
+            return False
+        if not self.is_admin():
+            cprint("admin privileges required", "red")
+            return False
+        return True
+    ###########
 
     def _login(self, username: str, password: str) -> bool:
         """Low-level authenticate (no prompting)."""
@@ -126,7 +218,6 @@ class AccountManager:
         if not user:
             return False
         self.current_user_id = user["id"]
-        self.current_privilege = user["privilege_level"]
         level_name = AccountManager.PrivilegeLevel(user["privilege_level"]).name.lower()
         prefix = f"{level_name}: " if level_name != "user" else ""
         cprint(f"logged in as {prefix}{colored(username, 'yellow', attrs=['bold'])}", "green")
@@ -134,6 +225,13 @@ class AccountManager:
 
     def login(self, username: str | None = None, password: str | None = None):
         """Interactive login (prompts until success if creds not provided)."""
+        if self.current_user_id is not None:
+            cprint("already logged in", "yellow")
+            prompt = input("would you like to log out first? (y/N): ").strip()
+            if parse_boolean_input(prompt, handle_invalid=True):
+                self.logout()
+            else:
+                return
         if username is not None and password is not None:
             if not self._login(username, password):
                 cprint("invalid username or password", "red")
@@ -149,24 +247,83 @@ class AccountManager:
     def user_exists(self, username: str) -> bool:
         """Check if a user with the given username exists."""
         user = self.db.conn.execute(
-            "SELECT id FROM accounts WHERE username=?;",
+            "SELECT 1 FROM accounts WHERE username=? LIMIT 1;",
             (username,)
         ).fetchone()
-        
         return user is not None
     
     def logout(self):
         """Log out the current user."""
         if self.current_user_id is not None:
             cprint(f"logged out user with id #{self.current_user_id} successfully", "green")
-            self.current_user_id = None
-            self.current_privilege = 0
+            self._reset_session()
         else:
             cprint("no user currently logged in", "red")
 
     def is_admin(self):
         return self.current_privilege == AccountManager.PrivilegeLevel.ADMIN.value
+    
+    def register(self, username: str | None = None, password: str | None = None):
+        """Interactive user registration (enforces uniqueness & basic validation)."""
+        if username is None:
+            username = input(colored("choose a username: ", "magenta")).strip()
+        if password is None:
+            password = input(colored("choose a password: ", "magenta")).strip()
 
+        # validation
+        if not (3 <= len(username) <= 20) or not username.isalnum():
+            cprint("username must be 3-20 chars and alphanumeric", "red")
+            return
+        if len(password) < 4:
+            cprint("password too short (min 4)", "red")
+            return
+        if self.user_exists(username):
+            cprint("username already taken", "red")
+            return
+        
+        level: AccountManager.PrivilegeLevel = AccountManager.PrivilegeLevel.USER
+        
+        if self.is_admin():
+            # allow admin to set privilege level for new user
+            prompt = input(f"set new user as admin? {colored('(dangerous)', 'red')} (y/N): ").strip().lower()
+            if parse_boolean_input(prompt, handle_invalid=True):
+                level = AccountManager.PrivilegeLevel.ADMIN
+
+        self.db.conn.execute(
+            "INSERT INTO accounts(username, password, privilege_level) VALUES(?,?,?);",
+            (username, password, level.value)
+        )
+        cprint("account created! you can now login.", "green")
+
+    def register_or_login(self, username: str | None = None, password: str | None = None):
+        """Combined registration and login for convenience."""
+        prompt = input(f"would you like to ({colored("r", "light_blue")})egister or ({colored("l", "light_blue")})ogin?: ").strip().lower()
+        match prompt:
+            case "r":
+                self.register(username, password)
+            case "l":
+                self.login(username, password)
+            case _:
+                cprint("invalid option", "red")
+
+    def whoami(self):
+        """Display info about the currently logged-in user."""
+        if self.current_user_id is None:
+            cprint("no user currently logged in", "red")
+            return
+        
+        user = self.db.conn.execute(
+            "SELECT username, privilege_level FROM accounts WHERE id=?;",
+            (self.current_user_id,)
+        ).fetchone()
+        if not user:
+            cprint("error fetching user info", "red")
+            return
+        
+        level_name = AccountManager.PrivilegeLevel(user["privilege_level"]).name.lower()
+        prefix = f"{level_name}: " if level_name != "user" else ""
+        cprint(f"you are logged in as {prefix}{colored(user['username'], 'yellow', attrs=['bold'])}", "green")
+        
 # establish a base class for order items
 class OrderItem(ABC):
     """Abstract base class for items that can be ordered."""
@@ -628,6 +785,173 @@ class OrderManager:
             
         cprint(f"total sales for today: ${total_sales:.2f}", "green")
         cprint("thank you for using papa-pizza!", "green")
+        
+    # ADMIN REPORTS BELOW -------------------------------------------------
+    def admin_report_revenue_by_user(self):
+        """[ADMIN] Show total revenue per customer (paid orders only)."""
+        if not self.account_manager.require_admin():
+            return
+        rows = self.db.conn.execute(
+            """--sql 
+            SELECT
+                COALESCE(a.username, 'guest') AS username,
+                COUNT(o.id) AS order_count,
+                SUM(ot.final_total) AS total_revenue
+            FROM order_totals ot
+            JOIN orders o ON o.id = ot.order_id
+            LEFT JOIN accounts a ON a.id = o.customer_id
+            WHERE o.paid = 1
+            GROUP BY o.customer_id
+            ORDER BY total_revenue DESC;
+            """
+        ).fetchall()
+        if not rows:
+            cprint("no data", "red")
+            return
+        cprint("revenue by user (paid orders)", "green", attrs=["bold"])
+        for r in rows:
+            print(f"{r['username']}: {r['order_count']} orders -> ${r['total_revenue']:.2f}")
+
+    def admin_report_top_menu_items(self):
+        """[ADMIN] Show most ordered menu items with counts & revenue."""
+        if not self.account_manager.require_admin():
+            return
+        rows = self.db.conn.execute(
+            """--sql
+            SELECT m.name, COUNT(oi.id) AS times_ordered, ROUND(SUM(m.price),2) AS revenue
+            FROM order_items oi
+            JOIN menu m ON m.id = oi.menu_item_id
+            JOIN orders o ON o.id = oi.order_id
+            WHERE o.paid=1
+            GROUP BY m.id
+            ORDER BY times_ordered DESC, m.name ASC
+            LIMIT 10;
+            """
+        ).fetchall()
+        if not rows:
+            cprint("no data", "red")
+            return
+        cprint("top menu items (paid)", "green", attrs=["bold"])
+        for r in rows:
+            print(f"{r['name']}: {r['times_ordered']} sold -> ${r['revenue']:.2f}")
+
+    def admin_report_average_order_value(self):
+        """[ADMIN] Aggregate metrics: avg, min, max for paid orders."""
+        if not self.account_manager.require_admin():
+            return
+        r = self.db.conn.execute(
+            """--sql
+            SELECT
+                ROUND(AVG(final_total),2) AS avg_value,
+                ROUND(MIN(final_total),2) AS min_value,
+                ROUND(MAX(final_total),2) AS max_value,
+                COUNT(*) AS paid_orders
+            FROM order_totals
+            WHERE paid = 1;
+            """
+        ).fetchone()
+        cprint("order value stats (paid)", "green", attrs=["bold"])
+        if r and r["paid_orders"]:
+            print(f"orders: {r['paid_orders']} | avg ${r['avg_value']:.2f} | min ${r['min_value']:.2f} | max ${r['max_value']:.2f}")
+        else:
+            print("no paid orders")
+
+    def admin_report_discount_usage(self):
+        """[ADMIN] Show how many orders received discounts and % usage."""
+        if not self.account_manager.require_admin():
+            return
+        r = self.db.conn.execute(
+            """--sql
+            SELECT SUM(CASE WHEN is_discounted=1 THEN 1 ELSE 0 END) AS discounted,
+                   COUNT(*) AS total
+            FROM orders;
+            """
+        ).fetchone()
+        if not r or r['total']==0:
+            cprint("no orders", "red")
+            return
+        pct = (r['discounted']/r['total'])*100
+        cprint("discount usage", "green", attrs=["bold"])
+        print(f"{r['discounted']} / {r['total']} orders ({pct:.1f}%) received discount or loyalty pricing")
+
+    # ADMIN DATA MANAGEMENT (accounts & menu) -----------------------------
+    def admin_list_accounts(self):
+        if not self.account_manager.require_admin():
+            return
+        rows = self.db.conn.execute(
+            "SELECT id, username, privilege_level FROM accounts ORDER BY id;"
+        ).fetchall()
+        for r in rows:
+            role = 'admin' if r['privilege_level']==1 else 'user'
+            print(f"#{r['id']}: {r['username']} ({role})")
+
+    def admin_promote(self, user_id: str):
+        if not self.account_manager.require_admin():
+            return
+        if not user_id.isdigit():
+            cprint("invalid id", "red"); return
+        self.db.conn.execute("UPDATE accounts SET privilege_level=1 WHERE id=?;", (int(user_id),))
+        cprint("promoted", "green")
+
+    def admin_demote(self, user_id: str):
+        if not self.account_manager.require_admin():
+            return
+        if not user_id.isdigit():
+            cprint("invalid id", "red"); return
+        self.db.conn.execute("UPDATE accounts SET privilege_level=0 WHERE id=?;", (int(user_id),))
+        cprint("demoted", "green")
+
+    def admin_menu_add(self, name: str | None = None, price: str | None = None):
+        if not self.account_manager.require_admin():
+            return
+        if name is None:
+            name = input("menu item name: ").strip()
+        if price is None:
+            price = input("price: ").strip()
+        try:
+            p = float(price)
+            if p <= 0:
+                raise ValueError
+        except:
+            cprint("invalid price", "red"); return
+        try:
+            self.db.conn.execute("INSERT INTO menu(name, price) VALUES(?,?);", (name, p))
+            reload_menu(self)
+            cprint("menu item added", "green")
+        except Exception as e:
+            cprint(f"failed: {e}", "red")
+
+    def admin_menu_update_price(self, name: str | None = None, price: str | None = None):
+        if not self.account_manager.require_admin():
+            return
+        if name is None:
+            name = input("menu item name: ").strip()
+        if price is None:
+            price = input("new price: ").strip()
+        try:
+            p = float(price)
+            if p <= 0:
+                raise ValueError
+        except:
+            cprint("invalid price", "red"); return
+        cur = self.db.conn.execute("UPDATE menu SET price=? WHERE lower(name)=lower(?);", (p, name))
+        if cur.rowcount:
+            reload_menu(self)
+            cprint("updated", "green")
+        else:
+            cprint("not found", "red")
+
+    def admin_menu_delete(self, name: str | None = None):
+        if not self.account_manager.require_admin():
+            return
+        if name is None:
+            name = input("menu item name: ").strip()
+        cur = self.db.conn.execute("DELETE FROM menu WHERE lower(name)=lower(?);", (name,))
+        if cur.rowcount:
+            reload_menu(self)
+            cprint("deleted", "green")
+        else:
+            cprint("not found", "red")
 
 def parse_boolean_input(prompt: str, handle_invalid: bool = False) -> bool:
     """Parse 'y/n' input, returning True for yes. Invalid only retried if handle_invalid=True."""
@@ -641,10 +965,11 @@ def parse_boolean_input(prompt: str, handle_invalid: bool = False) -> bool:
 
 class Command:
     """Bind a CLI command name to a function and its description."""
-    def __init__(self, name: str, function: Callable, description: str):
+    def __init__(self, name: str, function: Callable, description: str, privilege_level: AccountManager.PrivilegeLevel | None = AccountManager.PrivilegeLevel.USER):
         self.name = name
         self.__function__ = function
         self.description = description
+        self.privilege_level = privilege_level
 
     def execute(self, tokens: list[str], required_count=None):
         """Validate argument count then invoke the bound function."""
@@ -666,29 +991,48 @@ class Command:
 
 class CommandParser:
     """Parse user input, map to commands, and run them in a REPL."""
-    def __init__(self, account_manager=None):
+    def __init__(self, account_manager: AccountManager):
         # Register basic commands
         self.account_manager = account_manager
         
         self.commands = [
-            Command("help", self.show_help, "Display this help message."),
-            Command("h", self.show_help, "Alias for 'help'."),
-            Command("quit", self.quit, "Exit the program."),
-            Command("exit", lambda: cprint("use quit to exit", "yellow"), "Alias for 'quit'."),
+            Command("help", self.show_help, "Display this help message.", None),
+            Command("h", self.show_help, "Alias for 'help'.", None),
+            Command("quit", self.quit, "Exit the program.", None),
+            Command("exit", lambda: cprint("use quit to exit", "yellow"), "Alias for 'quit'.", None),
         ]
 
     def parse_and_execute(self, input_str):
-        """Match the input string to a registered command and execute."""
+        """Match the input string to a registered command, auto-login if needed, enforce privilege."""
         tokens = input_str.strip().split()
+        if not tokens:
+            return None
         for command in self.commands:
             name_parts = command.name.split()
-            if tokens[:len(name_parts)] == name_parts:
-                if self.account_manager and self.account_manager.current_user_id is None:
-                    cprint("please sign in first.", "red")
-                    return None
-                args = tokens[len(name_parts):]
-                return command.execute(args)
-        
+            if tokens[:len(name_parts)] != name_parts:
+                continue
+
+            # if command requires auth (privilege_level not None) and user not logged in -> trigger login
+            if (command.privilege_level is not None
+                and self.account_manager.current_user_id is None):
+                cprint("please register/login to continue", "yellow")
+                self.account_manager.register_or_login()
+
+            # after (possibly) logging in, if still no user and auth required, abort
+            if (command.privilege_level is not None
+                and self.account_manager.current_user_id is None):
+                cprint("authentication required", "red")
+                return None
+
+            # privilege enforcement (admin-only)
+            if (command.privilege_level == AccountManager.PrivilegeLevel.ADMIN 
+                and not self.account_manager.is_admin()):
+                cprint("insufficient privileges", "red")
+                return None
+
+            args = tokens[len(name_parts):]
+            return command.execute(args)
+
         cprint("unknown command. type 'help'.", "red")
         return None
 
@@ -697,8 +1041,10 @@ class CommandParser:
         cprint("available commands:", "green", attrs=["bold"])
         for cmd in self.commands:
             # Only show admin commands if user is admin
-            if "[admin]" in cmd.description and (not self.account_manager or not self.account_manager.is_admin()):
+            if (cmd.privilege_level == AccountManager.PrivilegeLevel.ADMIN
+                and not self.account_manager.is_admin()):
                 continue
+            
             signature = inspect.signature(cmd.__function__)
 
             # format params
@@ -736,6 +1082,8 @@ class Application:
     """Wire together CLI commands with the OrderManager and start the REPL."""
     def __init__(self, *args):
         self.db = DatabaseManager()
+        atexit.register(lambda: self.db.conn.close() if self.db.conn else None)
+
         self.account_manager = AccountManager(self.db)
         self.order_manager = OrderManager(self.db, self.account_manager)
         parser = CommandParser(self.account_manager)
@@ -743,6 +1091,7 @@ class Application:
         # register commands
         parser.commands.append(Command("menu", self.show_menu, "Show the menu"))
 
+        # order commands
         parser.commands.append(Command("order create", self.order_manager.create_order, "Add an order"))
         parser.commands.append(Command("order remove", self.order_manager.remove_order, "Remove an order (by id)"))
         parser.commands.append(Command("order list", self.order_manager.list_orders, "List all orders"))
@@ -753,6 +1102,69 @@ class Application:
         parser.commands.append(Command("order item remove", self.order_manager.remove_order_item, "Remove an item from the current order"))
 
         parser.commands.append(Command("order summary", self.order_manager.generate_daily_sales_summary, "Generate daily sales summary"))
+        
+        # account commands
+        parser.commands.append(Command("account whoami", self.account_manager.whoami, "Display current user info", None))
+        parser.commands.append(Command("account login", self.account_manager.login, "Log in to your account", None))
+        parser.commands.append(Command("account logout", self.account_manager.logout, "Log out of your account", None))
+        parser.commands.append(Command("account register", self.account_manager.register, "Register a new account", None))
+
+        # admin commands
+        parser.commands.append(Command(
+            "admin accounts list", self.order_manager.admin_list_accounts,
+            "List all user accounts", AccountManager.PrivilegeLevel.ADMIN
+        ))
+        
+        parser.commands.append(Command(
+            "admin accounts promote", self.order_manager.admin_promote,
+            "Promote user to admin", AccountManager.PrivilegeLevel.ADMIN
+        ))
+        
+        parser.commands.append(Command(
+            "admin accounts demote", self.order_manager.admin_demote,
+            "Demote admin to user", AccountManager.PrivilegeLevel.ADMIN
+        ))
+        
+        parser.commands.append(Command(
+            "admin menu add", self.order_manager.admin_menu_add,
+            "Add a menu item", AccountManager.PrivilegeLevel.ADMIN
+        ))
+        
+        parser.commands.append(Command(
+            "admin menu update", self.order_manager.admin_menu_update_price,
+            "Update menu item price", AccountManager.PrivilegeLevel.ADMIN
+        ))
+        
+        parser.commands.append(Command(
+            "admin menu delete", self.order_manager.admin_menu_delete,
+            "Delete menu item", AccountManager.PrivilegeLevel.ADMIN
+        ))
+
+        # ADMIN: reporting queries demonstrating aggregates, group/order by, joins, calculated fields
+        parser.commands.append(Command(
+            "admin report revenue", self.order_manager.admin_report_revenue_by_user,
+            "Revenue by user (GROUP BY, SUM, COUNT)", AccountManager.PrivilegeLevel.ADMIN
+        ))
+        
+        parser.commands.append(Command(
+            "admin report top-items", self.order_manager.admin_report_top_menu_items,
+            "Top menu items (JOIN, GROUP BY, ORDER BY)", AccountManager.PrivilegeLevel.ADMIN
+        ))
+        
+        parser.commands.append(Command(
+            "admin report stats", self.order_manager.admin_report_average_order_value,
+            "Order value statistics (AVG/MIN/MAX)", AccountManager.PrivilegeLevel.ADMIN
+        ))
+        
+        parser.commands.append(Command(
+            "admin report discount", self.order_manager.admin_report_discount_usage,
+            "Discount usage summary", AccountManager.PrivilegeLevel.ADMIN
+        ))
+        
+        parser.commands.append(Command(
+            "admin db reset", self.db.reset_database,
+            "Reset the database to initial state", AccountManager.PrivilegeLevel.ADMIN
+        ))
 
         cprint("""
 welcome to papa-pizza, the sequel!!! 🍕,
@@ -765,8 +1177,6 @@ by vapidinfinity, aka esi
               
 for more information, type 'help' or 'h' at any time.
 to exit the program, type 'quit' or 'exit'.""")
-        
-        self.account_manager.login()
 
         if args:
             parser.parse_and_execute(" ".join(args))
@@ -786,8 +1196,7 @@ to exit the program, type 'quit' or 'exit'.""")
                 
             cprint(f"{item.name}: ${item.price:.2f}", "green")
     
-    
-            
+   
 # Main function to run the program
 def main():
     """Entry point: instantiate Application with optional CLI args."""
