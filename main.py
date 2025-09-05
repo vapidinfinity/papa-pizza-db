@@ -109,7 +109,7 @@ class AccountManager:
     """Manage user accounts, including login and privilege checks."""
     def __init__(self, db: DatabaseManager):
         self.db = db
-        self._current_user_id: int | None = None
+        self.current_user_id: int | None = None
         self.current_privilege: int = 0
 
     class PrivilegeLevel(Enum):
@@ -166,10 +166,6 @@ class AccountManager:
 
     def is_admin(self):
         return self.current_privilege == AccountManager.PrivilegeLevel.ADMIN.value
-
-    @property
-    def current_user_id(self):
-        return self._current_user_id
 
 # establish a base class for order items
 class OrderItem(ABC):
