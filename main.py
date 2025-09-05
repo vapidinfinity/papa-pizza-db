@@ -109,7 +109,7 @@ class AccountManager:
     """Manage user accounts, including login and privilege checks."""
     def __init__(self, db: DatabaseManager):
         self.db = db
-        self.current_user_id: int | None = None
+        self._current_user_id: int | None = None
         self.current_privilege: int = 0
 
     class PrivilegeLevel(Enum):
@@ -167,8 +167,9 @@ class AccountManager:
     def is_admin(self):
         return self.current_privilege == AccountManager.PrivilegeLevel.ADMIN.value
 
-    def get_current_user_id(self):
-        return self.current_user_id
+    @property
+    def current_user_id(self):
+        return self._current_user_id
 
 # establish a base class for order items
 class OrderItem(ABC):
@@ -284,7 +285,7 @@ class OrderManager:
 
     def insert_order(self, service_type: int, has_loyalty: bool) -> int:
         # Attach order to current user if signed in
-        customer_id = self.account_manager.get_current_user_id()
+        customer_id = self.account_manager.current_user_id
         cur = self.db.conn.execute(
             "INSERT INTO orders(customer_id, service_type, has_loyalty_card) VALUES(?,?,?);",
             (customer_id, service_type, int(has_loyalty)),
@@ -300,7 +301,7 @@ class OrderManager:
             return self.db.conn.execute(
                 "SELECT id, customer_id, service_type, has_loyalty_card, is_discounted, paid FROM orders ORDER BY id;"
             ).fetchall()
-        uid = self.account_manager.get_current_user_id()
+        uid = self.account_manager.current_user_id
         return self.db.conn.execute(
             "SELECT id, customer_id, service_type, has_loyalty_card, is_discounted, paid FROM orders WHERE customer_id=? ORDER BY id;",
             (uid,),
@@ -366,7 +367,7 @@ class OrderManager:
             return self.db.conn.execute(
                 "SELECT id, customer_id, service_type, has_loyalty_card, is_discounted, paid FROM orders WHERE paid=1 ORDER BY id;"
             ).fetchall()
-        uid = self.account_manager.get_current_user_id()
+        uid = self.account_manager.current_user_id
         return self.db.conn.execute(
             "SELECT id, customer_id, service_type, has_loyalty_card, is_discounted, paid FROM orders WHERE paid=1 AND customer_id=? ORDER BY id;",
             (uid,),
@@ -433,7 +434,7 @@ class OrderManager:
         # only allow removing own orders (unless admin)
         if not self.account_manager.is_admin():
             db_row = self.fetch_order_by_id(order_id)
-            if db_row and db_row["customer_id"] != self.account_manager.get_current_user_id():  # fixed .get misuse
+            if db_row and db_row["customer_id"] != self.account_manager.current_user_id:  # fixed .get misuse
                 cprint("you can only remove your own orders.", "red")
                 return
             
@@ -685,7 +686,7 @@ class CommandParser:
         for command in self.commands:
             name_parts = command.name.split()
             if tokens[:len(name_parts)] == name_parts:
-                if self.account_manager and self.account_manager.get_current_user_id() is None:
+                if self.account_manager and self.account_manager.current_user_id is None:
                     cprint("please sign in first.", "red")
                     return None
                 args = tokens[len(name_parts):]
